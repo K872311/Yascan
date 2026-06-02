@@ -1,0 +1,343 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers on tags like v2.0.0, v2.1.0, etc.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Run tests first - build jobs depend on this passing
+  test:
+    name: Pre-release Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ubuntu-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-cargo-test-
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Setup test environment
+        run: |
+          # Create build directory structure
+          mkdir -p build/config
+          mkdir -p build/signatures/yara
+          mkdir -p build/signatures/iocs
+          
+          # ALSO create signatures and config at project root
+          # (Loki looks for ./signatures/ and ./config/ relative to cwd)
+          mkdir -p signatures/yara
+          mkdir -p signatures/iocs
+          mkdir -p config
+          
+          # Copy binaries
+          cp target/release/loki build/
+          cp target/release/loki-util build/
+          
+          # Copy config (use example if regular config doesn't exist)
+          if [ -f "config/excludes.cfg" ]; then
+            cp config/excludes.cfg build/config/
+          elif [ -f "config/excludes.cfg.example" ]; then
+            cp config/excludes.cfg.example build/config/excludes.cfg
+            cp config/excludes.cfg.example config/excludes.cfg
+          else
+            # Create empty config
+            echo "# Empty exclusions config for testing" > build/config/excludes.cfg
+            echo "# Empty exclusions config for testing" > config/excludes.cfg
+          fi
+          
+          # Create minimal test YARA rule
+          echo 'rule test_placeholder { meta: score = 0 condition: false }' > signatures/yara/yara-rules-core.yar
+          cp signatures/yara/yara-rules-core.yar build/signatures/yara/
+          
+          # Create minimal IOC files with proper format
+          echo "# Filename IOCs for testing" > signatures/iocs/filename-iocs.txt
+          echo "# Hash IOCs for testing" > signatures/iocs/hash-iocs.txt
+          echo "# C2 IOCs for testing" > signatures/iocs/c2-iocs.txt
+          echo "# Keywords for testing" > signatures/iocs/keywords.txt
+          
+          # Copy to build as well
+          cp signatures/iocs/* build/signatures/iocs/
+          
+          # Make test scripts executable
+          chmod +x tests/*.sh
+          chmod +x tests/**/*.sh 2>/dev/null || true
+
+      - name: Verify binaries
+        run: |
+          echo "Testing loki binary..."
+          ./build/loki --version
+          echo ""
+          echo "Testing loki-util binary..."
+          ./build/loki-util || true
+
+      - name: Run test suite
+        run: |
+          chmod +x tests/run_all_tests.sh
+          ./tests/run_all_tests.sh
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test  # Tests must pass before building release artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: loki-linux-x86_64
+            binary_name: loki
+            archive_format: tar.gz
+          
+          # Linux ARM64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: loki-linux-aarch64
+            binary_name: loki
+            archive_format: tar.gz
+          
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: loki-windows-x86_64
+            binary_name: loki.exe
+            archive_format: zip
+
+          # Windows ARM64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact_name: loki-windows-aarch64
+            binary_name: loki.exe
+            archive_format: zip
+          
+          # macOS x86_64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: loki-macos-x86_64
+            binary_name: loki
+            archive_format: tar.gz
+          
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: loki-macos-aarch64
+            binary_name: loki
+            archive_format: tar.gz
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Install cross-compilation dependencies (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure Cargo for cross-compilation (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ matrix.binary_name }}
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/loki-util
+          else
+            strip target/${{ matrix.target }}/release/${{ matrix.binary_name }}
+            strip target/${{ matrix.target }}/release/loki-util
+          fi
+
+      - name: Fetch signatures
+        shell: bash
+        run: |
+          mkdir -p signatures/yara signatures/iocs tmp
+          curl -sL https://github.com/YARAHQ/yara-forge/releases/latest/download/yara-forge-rules-core.zip -o tmp/yara-forge-rules-core.zip
+          python -c "import zipfile; zipfile.ZipFile('tmp/yara-forge-rules-core.zip').extractall('tmp/yara-forge')"
+          find tmp/yara-forge -name "*.yar" -exec cp {} signatures/yara/ \;
+          rm -rf tmp
+
+          # IOCs are optional and user-supplied; provide placeholder files.
+          echo "# Optional custom hash IOCs" > signatures/iocs/hash-iocs.txt
+          echo "# Optional custom filename IOCs" > signatures/iocs/filename-iocs.txt
+          echo "# Optional custom C2 IOCs" > signatures/iocs/c2-iocs.txt
+          echo "# Optional custom keyword IOCs" > signatures/iocs/keywords.txt
+
+      - name: Create release archive (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          ARCHIVE_NAME="${{ matrix.artifact_name }}-${VERSION}.${{ matrix.archive_format }}"
+          
+          UTIL_BINARY_NAME="loki-util"
+          
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} staging/
+          cp target/${{ matrix.target }}/release/$UTIL_BINARY_NAME staging/
+          cp -r signatures staging/
+          
+          cd staging
+          tar czf "../${ARCHIVE_NAME}" *
+          cd ..
+          
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          echo "BINARY_NAME=${{ matrix.binary_name }}" >> $GITHUB_ENV
+
+      - name: Create release archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ github.ref }}".Replace("refs/tags/", "")
+          $ARCHIVE_NAME = "${{ matrix.artifact_name }}-$VERSION.${{ matrix.archive_format }}"
+          
+          New-Item -ItemType Directory -Path staging -Force
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" -Destination staging/
+          Copy-Item "target/${{ matrix.target }}/release/loki-util.exe" -Destination staging/
+          Copy-Item -Recurse signatures -Destination staging/
+          
+          Compress-Archive -Path staging/* -DestinationPath $ARCHIVE_NAME
+          
+          "ARCHIVE_NAME=$ARCHIVE_NAME" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "BINARY_NAME=${{ matrix.binary_name }}" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Generate checksums (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          echo "CHECKSUM_FILE=${ARCHIVE_NAME}.sha256" >> $GITHUB_ENV
+
+      - name: Generate checksums (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Path $env:ARCHIVE_NAME -Algorithm SHA256
+          "$($hash.Hash)  $env:ARCHIVE_NAME" | Out-File -FilePath "$env:ARCHIVE_NAME.sha256" -Encoding ASCII
+          "CHECKSUM_FILE=$env:ARCHIVE_NAME.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.CHECKSUM_FILE }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Tag version: ${VERSION}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## Loki-RS ${{ steps.version.outputs.VERSION }}
+            
+            All tests passed before this release was built.
+            
+            ### Downloads
+            
+            **Linux (x86_64)**
+            - Binary: `loki-linux-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz`
+            - Checksum: `loki-linux-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz.sha256`
+            
+            **Linux (ARM64)**
+            - Binary: `loki-linux-aarch64-${{ steps.version.outputs.VERSION }}.tar.gz`
+            - Checksum: `loki-linux-aarch64-${{ steps.version.outputs.VERSION }}.tar.gz.sha256`
+            
+            **Windows (x86_64)**
+            - Binary: `loki-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip`
+            - Checksum: `loki-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip.sha256`
+
+            **Windows (ARM64)**
+            - Binary: `loki-windows-aarch64-${{ steps.version.outputs.VERSION }}.zip`
+            - Checksum: `loki-windows-aarch64-${{ steps.version.outputs.VERSION }}.zip.sha256`
+            
+            **macOS (x86_64)**
+            - Binary: `loki-macos-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz`
+            - Checksum: `loki-macos-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz.sha256`
+            
+            **macOS (ARM64/Apple Silicon)**
+            - Binary: `loki-macos-aarch64-${{ steps.version.outputs.VERSION }}.tar.gz`
+            - Checksum: `loki-macos-aarch64-${{ steps.version.outputs.VERSION }}.tar.gz.sha256`
+            
+            ### Installation
+            1. Download the appropriate binary for your platform
+            2. Extract the archive
+            3. Make binary executable (Linux/macOS): chmod +x loki
+            4. Run: ./loki-util update (to download newest signatures from YARA-Forge)
+            5. Run: ./loki --help
+
+          files: |
+            artifacts/**/*
+          draft: false
+          prerelease: false
+          tag_name: ${{ steps.version.outputs.VERSION }}

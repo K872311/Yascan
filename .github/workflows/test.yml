@@ -1,0 +1,251 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+
+      - name: Run unit tests
+        run: cargo test --verbose -- --test-threads=1
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Setup test environment
+        run: |
+          # Create build directory structure
+          mkdir -p build/config
+          mkdir -p build/signatures/yara
+          mkdir -p build/signatures/iocs
+          
+          # ALSO create signatures and config at project root
+          # (Loki looks for ./signatures/ and ./config/ relative to cwd)
+          mkdir -p signatures/yara
+          mkdir -p signatures/iocs
+          mkdir -p config
+          
+          # Copy binaries
+          cp target/release/loki build/
+          cp target/release/loki-util build/
+          
+          # Copy config (use example if regular config doesn't exist)
+          if [ -f "config/excludes.cfg" ]; then
+            cp config/excludes.cfg build/config/
+          elif [ -f "config/excludes.cfg.example" ]; then
+            cp config/excludes.cfg.example build/config/excludes.cfg
+            cp config/excludes.cfg.example config/excludes.cfg
+          else
+            # Create empty config
+            echo "# Empty exclusions config for testing" > build/config/excludes.cfg
+            echo "# Empty exclusions config for testing" > config/excludes.cfg
+          fi
+          
+          # Create minimal test YARA rule
+          echo 'rule test_placeholder { meta: score = 0 condition: false }' > signatures/yara/yara-rules-core.yar
+          cp signatures/yara/yara-rules-core.yar build/signatures/yara/
+          
+          # Create minimal IOC files with proper format
+          echo "# Filename IOCs for testing" > signatures/iocs/filename-iocs.txt
+          echo "# Hash IOCs for testing" > signatures/iocs/hash-iocs.txt
+          echo "# C2 IOCs for testing" > signatures/iocs/c2-iocs.txt
+          echo "# Keywords for testing" > signatures/iocs/keywords.txt
+          
+          # Copy to build as well
+          cp signatures/iocs/* build/signatures/iocs/
+          
+          # Make test scripts executable
+          chmod +x tests/*.sh
+          chmod +x tests/**/*.sh 2>/dev/null || true
+          
+          # Show what we have
+          echo "Build directory contents:"
+          ls -la build/
+          echo ""
+          echo "Project root signatures directory:"
+          ls -la signatures/ || true
+          echo ""
+          echo "Project root YARA directory:"
+          ls -la signatures/yara/ || true
+          echo ""
+          echo "Project root config directory:"
+          ls -la config/ || true
+
+      - name: Verify binaries
+        run: |
+          echo "Testing loki binary..."
+          ./build/loki --version
+          echo ""
+          echo "Testing loki-util binary..."
+          ./build/loki-util || true
+
+      - name: Run test suite
+        run: |
+          chmod +x tests/run_all_tests.sh
+          ./tests/run_all_tests.sh
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-failure-logs-${{ matrix.os }}
+          path: |
+            build/*.log
+            build/*.jsonl
+          retention-days: 7
+
+  test-windows:
+    name: Run Tests (Windows)
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-test-
+
+      - name: Run unit tests
+        run: cargo test --verbose -- --test-threads=1
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Setup test environment
+        shell: pwsh
+        run: |
+          # Create build directory structure
+          New-Item -ItemType Directory -Force -Path build/config
+          New-Item -ItemType Directory -Force -Path build/signatures/yara
+          New-Item -ItemType Directory -Force -Path build/signatures/iocs
+          
+          # ALSO create signatures and config at project root
+          New-Item -ItemType Directory -Force -Path signatures/yara
+          New-Item -ItemType Directory -Force -Path signatures/iocs
+          New-Item -ItemType Directory -Force -Path config
+          
+          # Copy binaries
+          Copy-Item target/release/loki.exe build/
+          Copy-Item target/release/loki-util.exe build/
+          
+          # Copy config (use example if regular config doesn't exist)
+          if (Test-Path "config/excludes.cfg.example") {
+            Copy-Item config/excludes.cfg.example build/config/excludes.cfg
+            Copy-Item config/excludes.cfg.example config/excludes.cfg
+          } else {
+            "# Empty exclusions config for testing" | Out-File -FilePath build/config/excludes.cfg
+            "# Empty exclusions config for testing" | Out-File -FilePath config/excludes.cfg
+          }
+          
+          # Create minimal test YARA rule
+          "rule test_placeholder { meta: score = 0 condition: false }" | Out-File -FilePath signatures/yara/yara-rules-core.yar
+          Copy-Item signatures/yara/yara-rules-core.yar build/signatures/yara/
+          
+          # Create minimal IOC files
+          "# Filename IOCs for testing" | Out-File -FilePath signatures/iocs/filename-iocs.txt
+          "# Hash IOCs for testing" | Out-File -FilePath signatures/iocs/hash-iocs.txt
+          "# C2 IOCs for testing" | Out-File -FilePath signatures/iocs/c2-iocs.txt
+          "# Keywords for testing" | Out-File -FilePath signatures/iocs/keywords.txt
+          
+          # Copy to build
+          Copy-Item signatures/iocs/* build/signatures/iocs/
+          
+          # Show what we have
+          Write-Host "Build directory contents:"
+          Get-ChildItem build/
+          Write-Host ""
+          Write-Host "Project root signatures:"
+          Get-ChildItem signatures/ -Recurse
+
+      - name: Verify binaries
+        shell: pwsh
+        run: |
+          Write-Host "Testing loki binary..."
+          ./build/loki.exe --version
+          Write-Host ""
+          Write-Host "Testing loki-util binary..."
+          ./build/loki-util.exe --help
+
+      - name: Run basic tests (Windows)
+        shell: pwsh
+        run: |
+          Write-Host "=== Running Windows Tests ==="
+          
+          # Test 1: Binary existence
+          Write-Host "Test 1: Binary Existence"
+          if ((Test-Path "./build/loki.exe") -and (Test-Path "./build/loki-util.exe")) {
+            Write-Host "PASS: Binaries exist"
+          } else {
+            Write-Host "FAIL: Binaries missing"
+            exit 1
+          }
+          
+          # Test 2: Help output
+          Write-Host "Test 2: Help Output"
+          $helpOutput = ./build/loki.exe --help 2>&1
+          if ($helpOutput -match "Loki-RS") {
+            Write-Host "PASS: Help output contains Loki-RS"
+          } else {
+            Write-Host "FAIL: Help output missing expected content"
+            Write-Host $helpOutput
+            exit 1
+          }
+          
+          # Test 3: Version output
+          Write-Host "Test 3: Version Output"
+          $versionOutput = ./build/loki.exe --version 2>&1
+          if ($versionOutput -match "Version") {
+            Write-Host "PASS: Version output valid"
+          } else {
+            Write-Host "FAIL: Version output missing"
+            Write-Host $versionOutput
+            exit 1
+          }
+          
+          Write-Host "=== All Windows Tests PASSED ==="
+
